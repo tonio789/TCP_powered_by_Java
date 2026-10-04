@@ -1,0 +1,74 @@
+# Managed by Nexo: GitNexus snapshots, no Supabase secrets in this repository.
+name: Nexo GitNexus
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: nexo-gitnexus
+  cancel-in-progress: true
+jobs:
+  index:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GITNEXUS_HOME: /tmp/nexo-gitnexus-state
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Install pinned GitNexus
+        run: npm install --prefix "$RUNNER_TEMP/nexo-gitnexus-tools" gitnexus@1.6.12 --no-audit --no-fund
+      - name: Index source without executing project scripts
+        run: node "$RUNNER_TEMP/nexo-gitnexus-tools/node_modules/gitnexus/dist/cli/index.js" analyze "$GITHUB_WORKSPACE" --name nexo --index-only --skip-fts
+      - name: Export graph and send authenticated snapshot to Nexo
+        shell: bash
+        run: |
+          node --input-type=module <<'NEXO_SCRIPT'
+          (async function actionsPublisher() {
+            const {spawn}=await import('node:child_process');
+            const cli=process.env.RUNNER_TEMP+'/nexo-gitnexus-tools/node_modules/gitnexus/dist/cli/index.js';
+            const child=spawn(process.execPath,[cli,'serve','--host','127.0.0.1','--port','4747'],{stdio:'ignore'});
+            let startupError;child.on('error',error=>{startupError=error;});
+            const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+            const get=async path=>{const r=await fetch('http://127.0.0.1:4747'+path,{signal:AbortSignal.timeout(60000)});if(!r.ok)throw new Error('GitNexus HTTP '+r.status);return r.json();};
+            try{
+              let online=false;
+              for(let i=0;i<60;i++){if(startupError)throw startupError;if(child.exitCode!==null)throw new Error('GitNexus server stopped');try{await get('/api/repos');online=true;break;}catch{await wait(1000);}}
+              if(!online)throw new Error('GitNexus server did not start');
+              const graph=await get('/api/graph?repo=nexo&includeContent=false');
+              if(!Array.isArray(graph.nodes)||!Array.isArray(graph.relationships))throw new Error('Unexpected GitNexus graph');
+              const str=(value,max)=>typeof value==='string'||typeof value==='number'?String(value).slice(0,max):'';
+              const parts=[];let part={nodes:[],relationships:[]},bytes=0;
+              const add=(key,item)=>{const size=Buffer.byteLength(JSON.stringify(item));if(bytes+size>850000){parts.push(part);part={nodes:[],relationships:[]};bytes=0;}part[key].push(item);bytes+=size;};
+              for(const n of graph.nodes)add('nodes',{id:str(n.id,500),label:str(n.label,80),properties:{name:str(n.properties?.name,200),filePath:str(n.properties?.filePath,1500),startLine:n.properties?.startLine}});
+              for(const r of graph.relationships)add('relationships',{sourceId:str(r.sourceId,500),targetId:str(r.targetId,500),type:str(r.type,120),confidence:r.confidence});
+              if(bytes||!parts.length)parts.push(part);
+              if(parts.length>500||graph.nodes.length>100000||graph.relationships.length>500000)throw new Error('Index exceeds supported storage capacity; no partial index was published');
+              const audience='https://nexo-swart-xi.vercel.app/gitnexus';
+              const oidcUrl=new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);oidcUrl.searchParams.set('audience',audience);
+              const identity=await fetch(oidcUrl,{headers:{Authorization:'Bearer '+process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN},signal:AbortSignal.timeout(15000)});
+              if(!identity.ok)throw new Error('GitHub did not issue the workflow identity');
+              const {value:token}=await identity.json();if(!token)throw new Error('Missing workflow identity');
+              for(let i=0;i<parts.length;i++){
+                const payload={format:'nexo-full-v2',repository:process.env.GITHUB_REPOSITORY,commit:process.env.GITHUB_SHA,engine_version:'1.6.12',part:i,part_count:parts.length,total_nodes:graph.nodes.length,total_edges:graph.relationships.length,graph:parts[i]};
+                let uploaded=false;
+                for(let attempt=0;attempt<3;attempt++){
+                  const response=await fetch('https://nexo-swart-xi.vercel.app/api/gitnexus-upload',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify(payload),redirect:'error',signal:AbortSignal.timeout(60000)});
+                  if(response.ok){uploaded=true;break;}
+                  if(![409,502,503,504].includes(response.status))throw new Error('Nexo rejected graph part (HTTP '+response.status+')');
+                  await wait(2000*(attempt+1));
+                }
+                if(!uploaded)throw new Error('Nexo could not persist the complete graph');
+              }
+              console.log(`GitNexus 1.6.12: ${graph.nodes.length} nodes, ${graph.relationships.length} relationships saved in Nexo.`);
+            }finally{child.kill('SIGTERM');}
+          })().catch(error=>{console.error(error.message);process.exitCode=1;});
+          NEXO_SCRIPT
